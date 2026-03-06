@@ -1,0 +1,23 @@
+// order.proto
+syntax = "proto3";
+package order;
+option go_package = "./proto";
+
+message Order {
+  uint64 id = 1;
+  uint64 quantity = 2;
+  bool is_removed = 3;
+}
+
+message PriceLevel {
+  uint64 price = 1;
+  uint32 decimals = 2;
+  repeated Order orders = 3;
+}
+
+message OrderBook {
+  repeated PriceLevel asks = 1;
+  repeated PriceLevel bids = 2;
+  uint64 last_seq_id = 3;
+  uint32 order_size = 4;
+}

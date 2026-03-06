@@ -1,0 +1,81 @@
+version: "3.8"
+
+services:
+  nats1:
+    image: nats:2.10
+    container_name: nats1
+    hostname: nats1
+    ports:
+      - "4222:4222"   # Client
+      - "8222:8222"   # Monitoring
+    volumes:
+      - ./docker/nats/conf/nats1.conf:/etc/nats/nats.conf:ro
+      - ./docker/nats/data/nats1:/data
+    command: [ "-c", "/etc/nats/nats.conf" ]
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8222/healthz" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - match_engine
+
+  nats2:
+    image: nats:2.10
+    container_name: nats2
+    hostname: nats2
+    ports:
+      - "4223:4222"   # Client
+      - "8223:8222"   # Monitoring
+    volumes:
+      - ./docker/nats/conf/nats2.conf:/etc/nats/nats.conf:ro
+      - ./docker/nats/data/nats2:/data
+    command: [ "-c", "/etc/nats/nats.conf" ]
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8222/healthz" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - match_engine
+
+  nats3:
+    image: nats:2.10
+    container_name: nats3
+    hostname: nats3
+    ports:
+      - "4224:4222"   # Client
+      - "8224:8222"   # Monitoring
+    volumes:
+      - ./docker/nats/conf/nats3.conf:/etc/nats/nats.conf:ro
+      - ./docker/nats/data/nats3:/data
+    command: [ "-c", "/etc/nats/nats.conf" ]
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8222/healthz" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - match_engine
+
+  # 可選：NATS Box 工具容器，方便操作
+  nats-box:
+    image: natsio/nats-box:latest
+    container_name: nats-box
+    depends_on:
+      - nats1
+      - nats2
+      - nats3
+    entrypoint: [ "sh", "-c", "sleep infinity" ]
+    restart: unless-stopped
+    networks:
+      - match_engine
+
+networks:
+  match_engine:
