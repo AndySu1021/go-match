@@ -24,8 +24,8 @@ func main() {
 		log.Fatalf("JetStream 初始化失敗: %v", err)
 	}
 
-	totalMsgs := 1000000
-	idx := 1000000
+	totalMsgs := 100000
+	idx := 100000
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 

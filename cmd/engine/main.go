@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go-match/config"
 	"go-match/internal"
+	"go-match/pkg/checkpoint"
 	"go-match/pkg/orderbook"
 	"log"
 	"log/slog"
@@ -15,7 +16,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,8 +25,8 @@ import (
 )
 
 var (
-	ob            *orderbook.OrderBook
-	recoverySeqID uint64
+	ob *orderbook.OrderBook
+	cp *checkpoint.Checkpoint
 )
 
 func init() {
@@ -41,6 +41,13 @@ func init() {
 		App:  config.InitAppConfig(),
 		Nats: config.InitNatsConfig(),
 	}
+
+	tmpCp, err := checkpoint.NewCheckpoint(cfg.App.Snapshot.Dir)
+	if err != nil {
+		panic(err)
+	}
+
+	cp = tmpCp
 
 	tmpOB, err := orderbook.NewOrderBook(cfg.App.Snapshot.Dir)
 	if err != nil {
@@ -90,32 +97,16 @@ func main() {
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:   ob.LastSeqID + 1,
-		MaxAckPending: 1, // 可以將這個調高
+		MaxAckPending: 10000, // 可以將這個調高
 		MaxDeliver:    3,
-		AckWait:       1 * time.Second, // 同時也要調高這個值，否則有可能重複投遞導致一張單撮 2 次以上
+		AckWait:       30 * time.Second, // 同時也要調高這個值，否則有可能重複投遞導致一張單撮 2 次以上
 	})
 	if err != nil {
 		log.Printf("建立 Pull Consumer 失敗: %v", err)
 		return
 	}
 
-	kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:  "SYSTEM_STATE",
-		History: 5,              // 每個 Key 保留最近 5 次修改紀錄
-		TTL:     24 * time.Hour, // 資料存活時間（選用）
-	})
-
-	// 檢查是否有數據需要回放
-	entry, err := kv.Get(ctx, "matcher.last_seq")
-	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		panic(err)
-	}
-	if entry != nil {
-		tmpSeqId, _ := strconv.ParseUint(string(entry.Value()), 10, 64)
-		recoverySeqID = tmpSeqId
-	}
-
-	go consume(ctx, cons, kv, js)
+	go consume(ctx, cons, js)
 	go snapshot(ctx)
 	//go readMemUsage(ctx)
 	//go pprof()
@@ -138,16 +129,13 @@ func main() {
 	log.Println("🛑 Shutting down...")
 }
 
-func consume(ctx context.Context, consumer jetstream.Consumer, kv jetstream.KeyValue, js jetstream.JetStream) {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
+func consume(ctx context.Context, consumer jetstream.Consumer, js jetstream.JetStream) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			msgs, err := consumer.Fetch(1000)
+		default:
+			msgs, err := consumer.Fetch(10000)
 			if err != nil && !errors.Is(err, jetstream.ErrNoMessages) {
 				log.Printf("Fetch 錯誤: %v", err)
 				continue
@@ -163,7 +151,9 @@ func consume(ctx context.Context, consumer jetstream.Consumer, kv jetstream.KeyV
 				if err != nil {
 					panic(err)
 				}
+
 				slog.Info(fmt.Sprintf("📦 [Pull] subject=%s data=%s seq_id=%d", msg.Subject(), string(msg.Data()), meta.Sequence.Stream))
+
 				if err = processOrder(ctx, meta.Sequence.Stream, msg.Data(), js); err != nil {
 					slog.Error("process order failed: ", err)
 					if meta.NumDelivered >= 3 {
@@ -174,7 +164,7 @@ func consume(ctx context.Context, consumer jetstream.Consumer, kv jetstream.KeyV
 					}
 					break
 				}
-				_, _ = kv.Put(ctx, "matcher.last_seq", []byte(strconv.FormatUint(meta.Sequence.Stream, 10)))
+				
 				msg.Ack()
 			}
 		}
@@ -210,10 +200,15 @@ func processOrder(ctx context.Context, seqId uint64, data []byte, js jetstream.J
 		}
 
 		// 以防止崩潰復原後重複推送成交日誌 queue
-		if infos != nil && ob.LastSeqID > recoverySeqID {
+		if infos != nil && ob.LastSeqID > cp.LastSeq() {
 			if err = publish(js, "matched.BTC_USDT", infos); err != nil {
 				return err
 			}
+			t1 := time.Now()
+			if err = cp.Save(seqId); err != nil {
+				return err
+			}
+			slog.Info(fmt.Sprintf("save latency: %d ms", time.Since(t1).Milliseconds()))
 		}
 	case orderbook.OrderActionCancel:
 		if err := ob.CancelOrder(order.ID); err != nil {
@@ -221,11 +216,14 @@ func processOrder(ctx context.Context, seqId uint64, data []byte, js jetstream.J
 			return err
 		}
 
-		if ob.LastSeqID > recoverySeqID {
+		if ob.LastSeqID > cp.LastSeq() {
 			if err := publish(js, "canceled.BTC_USDT", orderbook.CancelInfo{
 				OrderID: order.ID,
 				Memo:    "member manually cancelled",
 			}); err != nil {
+				return err
+			}
+			if err := cp.Save(seqId); err != nil {
 				return err
 			}
 		}
