@@ -77,5 +77,20 @@ services:
     networks:
       - match_engine
 
+  questdb:
+    image: questdb/questdb:9.3.2
+    container_name: questdb
+    ports:
+      - "9000:9000" # Web Console
+      - "9009:9009" # Influx Line Protocol (ILP) 高效寫入
+      - "8812:8812" # PostgreSQL Wire Protocol
+    volumes:
+      - ./docker/questdb/data:/root/.questdb
+    environment:
+      - QDB_TELEMETRY_ENABLED=false
+    restart: unless-stopped
+    networks:
+      - match_engine
+
 networks:
   match_engine:

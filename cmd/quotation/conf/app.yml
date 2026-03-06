@@ -1,0 +1,9 @@
+env: "local"
+instrument: "BTC_USDT"
+
+snapshot:
+  dir: "/Users/andysu/Desktop/open-source/go-match/runtime/"
+  period: 60
+
+consumer:
+  stream: "MATCH_ORDERS"

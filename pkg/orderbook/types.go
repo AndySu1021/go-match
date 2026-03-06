@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"go-match/proto/gen"
 	"sync"
+	"time"
 
 	"github.com/dolthub/swiss"
 )
@@ -142,11 +143,12 @@ type LevelOrder struct {
 }
 
 type MatchInfo struct {
-	MatchedPrice    uint64 `json:"match_price"`
-	MatchedQuantity uint64 `json:"match_quantity"`
-	Decimals        uint8  `json:"decimals"`
-	BuyerOrderID    uint64 `json:"buyer_order_id"`
-	SellerOrderID   uint64 `json:"seller_order_id"`
+	MatchedPrice    uint64    `json:"match_price"`
+	MatchedQuantity uint64    `json:"match_quantity"`
+	BuyerOrderID    uint64    `json:"buyer_order_id"`
+	SellerOrderID   uint64    `json:"seller_order_id"`
+	Decimals        uint8     `json:"decimals"`
+	Timestamp       time.Time `json:"timestamp"`
 }
 
 type MatchResult struct {

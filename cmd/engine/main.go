@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"go-match/config"
 	"go-match/internal"
+	"go-match/pkg/checkpoint"
 	"go-match/pkg/orderbook"
 	"log"
 	"log/slog"
-	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,8 +24,8 @@ import (
 )
 
 var (
-	ob            *orderbook.OrderBook
-	recoverySeqID uint64
+	ob *orderbook.OrderBook
+	cp *checkpoint.Checkpoint
 )
 
 func init() {
@@ -41,6 +40,13 @@ func init() {
 		App:  config.InitAppConfig(),
 		Nats: config.InitNatsConfig(),
 	}
+
+	tmpCp, err := checkpoint.NewCheckpoint(cfg.App.Snapshot.Dir)
+	if err != nil {
+		panic(err)
+	}
+
+	cp = tmpCp
 
 	tmpOB, err := orderbook.NewOrderBook(cfg.App.Snapshot.Dir)
 	if err != nil {
@@ -78,47 +84,29 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	name := fmt.Sprintf("consumer_%s", cfg.App.Instrument)
+	name := fmt.Sprintf("consumer:engine:%s", cfg.App.Instrument)
 
 	// 清除舊有 Consumer 做災難復原
-	_ = js.DeleteConsumer(ctx, "SPOT_ORDERS", name)
+	_ = js.DeleteConsumer(ctx, cfg.App.Consumer.Stream, name)
 
-	cons, err := js.CreateOrUpdateConsumer(ctx, "SPOT_ORDERS", jetstream.ConsumerConfig{
+	cons, err := js.CreateOrUpdateConsumer(ctx, cfg.App.Consumer.Stream, jetstream.ConsumerConfig{
 		Name:          name,
 		Durable:       name,
 		FilterSubject: fmt.Sprintf("orders.%s", cfg.App.Instrument),
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:   ob.LastSeqID + 1,
-		MaxAckPending: 1, // 可以將這個調高
+		MaxAckPending: 10000, // 可以將這個調高
 		MaxDeliver:    3,
-		AckWait:       1 * time.Second, // 同時也要調高這個值，否則有可能重複投遞導致一張單撮 2 次以上
+		AckWait:       30 * time.Second, // 同時也要調高這個值，否則有可能重複投遞導致一張單撮 2 次以上
 	})
 	if err != nil {
 		log.Printf("建立 Pull Consumer 失敗: %v", err)
 		return
 	}
 
-	kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:  "SYSTEM_STATE",
-		History: 5,              // 每個 Key 保留最近 5 次修改紀錄
-		TTL:     24 * time.Hour, // 資料存活時間（選用）
-	})
-
-	// 檢查是否有數據需要回放
-	entry, err := kv.Get(ctx, "matcher.last_seq")
-	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		panic(err)
-	}
-	if entry != nil {
-		tmpSeqId, _ := strconv.ParseUint(string(entry.Value()), 10, 64)
-		recoverySeqID = tmpSeqId
-	}
-
-	go consume(ctx, cons, kv, js)
+	go consume(ctx, cons, js)
 	go snapshot(ctx)
-	//go readMemUsage(ctx)
-	//go pprof()
 
 	// 等待 Ctrl+C 或 SIGTERM
 	quit := make(chan os.Signal, 1)
@@ -138,16 +126,13 @@ func main() {
 	log.Println("🛑 Shutting down...")
 }
 
-func consume(ctx context.Context, consumer jetstream.Consumer, kv jetstream.KeyValue, js jetstream.JetStream) {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
+func consume(ctx context.Context, consumer jetstream.Consumer, js jetstream.JetStream) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			msgs, err := consumer.Fetch(1000)
+		default:
+			msgs, err := consumer.Fetch(10000)
 			if err != nil && !errors.Is(err, jetstream.ErrNoMessages) {
 				log.Printf("Fetch 錯誤: %v", err)
 				continue
@@ -163,18 +148,19 @@ func consume(ctx context.Context, consumer jetstream.Consumer, kv jetstream.KeyV
 				if err != nil {
 					panic(err)
 				}
+
 				slog.Info(fmt.Sprintf("📦 [Pull] subject=%s data=%s seq_id=%d", msg.Subject(), string(msg.Data()), meta.Sequence.Stream))
+
 				if err = processOrder(ctx, meta.Sequence.Stream, msg.Data(), js); err != nil {
 					slog.Error("process order failed: ", err)
 					if meta.NumDelivered >= 3 {
-						// 方案 A: 讓 NATS 自動處理 (需配置下面第 3 點的 DLQ)
-						// 這裡我們直接 Terminate，表示不重試了，NATS 會根據配置送 DLQ
+						// TODO: consider deliver to DLQ
 						msg.Term()
 						continue
 					}
 					break
 				}
-				_, _ = kv.Put(ctx, "matcher.last_seq", []byte(strconv.FormatUint(meta.Sequence.Stream, 10)))
+
 				msg.Ack()
 			}
 		}
@@ -199,10 +185,10 @@ func processOrder(ctx context.Context, seqId uint64, data []byte, js jetstream.J
 
 		if !res.Success {
 			if errors.Is(res.Error, internal.ErrFOKInsufficientLiquidity) {
-				if err = publish(js, "canceled.BTC_USDT", orderbook.CancelInfo{
+				if err = publish(js, fmt.Sprintf("canceled.%s", cfg.App.Instrument), orderbook.CancelInfo{
 					OrderID: order.ID,
 					Memo:    internal.ErrFOKInsufficientLiquidity.Error(),
-				}); err != nil {
+				}, seqId); err != nil {
 					return err
 				}
 			}
@@ -210,8 +196,11 @@ func processOrder(ctx context.Context, seqId uint64, data []byte, js jetstream.J
 		}
 
 		// 以防止崩潰復原後重複推送成交日誌 queue
-		if infos != nil && ob.LastSeqID > recoverySeqID {
-			if err = publish(js, "matched.BTC_USDT", infos); err != nil {
+		if infos != nil && len(infos) > 0 && ob.LastSeqID > cp.LastSeq() {
+			if err = publish(js, fmt.Sprintf("matched.%s", cfg.App.Instrument), infos, seqId); err != nil {
+				return err
+			}
+			if err = cp.Save(seqId); err != nil {
 				return err
 			}
 		}
@@ -221,11 +210,14 @@ func processOrder(ctx context.Context, seqId uint64, data []byte, js jetstream.J
 			return err
 		}
 
-		if ob.LastSeqID > recoverySeqID {
-			if err := publish(js, "canceled.BTC_USDT", orderbook.CancelInfo{
+		if ob.LastSeqID > cp.LastSeq() {
+			if err := publish(js, fmt.Sprintf("canceled.%s", cfg.App.Instrument), orderbook.CancelInfo{
 				OrderID: order.ID,
 				Memo:    "member manually cancelled",
-			}); err != nil {
+			}, seqId); err != nil {
+				return err
+			}
+			if err := cp.Save(seqId); err != nil {
 				return err
 			}
 		}
@@ -250,38 +242,11 @@ func snapshot(ctx context.Context) {
 	}
 }
 
-func publish(js jetstream.JetStream, subject string, payload interface{}) error {
+func publish(js jetstream.JetStream, subject string, payload interface{}, reqId uint64) error {
 	// TODO: need to optimized for retry mechanism
 	tmp, _ := json.Marshal(payload)
-	if _, err := js.PublishAsync(subject, tmp); err != nil {
+	if _, err := js.PublishAsync(subject, tmp, jetstream.WithMsgID(strconv.FormatUint(reqId, 10))); err != nil {
 		return err
 	}
 	return nil
-}
-
-func readMemUsage(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			fmt.Println("=============================================")
-			fmt.Printf("Alloc = %v MiB\n", m.Alloc/1024/1024)
-			fmt.Printf("TotalAlloc = %v MiB\n", m.TotalAlloc/1024/1024)
-			fmt.Printf("Sys = %v MiB\n", m.Sys/1024/1024)
-			fmt.Printf("NumGC = %v\n", m.NumGC)
-			fmt.Println("=============================================")
-		}
-	}
-}
-
-func pprof() {
-	if err := http.ListenAndServe("localhost:5000", nil); err != nil {
-		panic(err)
-	}
 }

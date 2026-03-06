@@ -208,10 +208,6 @@ func (ob *OrderBook) String() string {
 	return string(tmp)
 }
 
-func (ob *OrderBook) rebuildOrderMap(size uint32) {
-
-}
-
 func (ob *OrderBook) addOrder(order Order) error {
 	if order.Quantity == 0 {
 		slog.Error(fmt.Sprintf("order quantity is zero: %d", order.ID))
@@ -249,6 +245,7 @@ func (ob *OrderBook) addOrder(order Order) error {
 		IsRemoved: false,
 	}
 
+	needRebuild := false
 	if pos < len(levels) && levels[pos].Price == order.Price {
 		offset = len(levels[pos].Orders)
 		levels[pos].Orders = append(levels[pos].Orders, levelOrder)
@@ -261,6 +258,7 @@ func (ob *OrderBook) addOrder(order Order) error {
 			Orders:   []LevelOrder{levelOrder},
 		}
 		offset = 0
+		needRebuild = true
 	}
 
 	ob.OrderMap.Put(order.ID, OrderLocation{
@@ -273,6 +271,10 @@ func (ob *OrderBook) addOrder(order Order) error {
 		ob.Bids = levels
 	} else {
 		ob.Asks = levels
+	}
+
+	if needRebuild {
+		ob.buildOrderMap(uint32(ob.OrderMap.Count()))
 	}
 
 	return nil
@@ -299,6 +301,12 @@ func (ob *OrderBook) removeOrder(orderId uint64) error {
 	// 只標記，不實際刪除
 	levels[loc.LevelPos].Orders[loc.Offset].IsRemoved = true
 	levels[loc.LevelPos].RemovedCount++
+
+	if loc.Side == OrderSideBuy {
+		ob.Bids = levels
+	} else {
+		ob.Asks = levels
+	}
 
 	ob.OrderMap.Delete(orderId)
 
@@ -399,6 +407,7 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 				MatchedPrice:    levels[i].Price,
 				MatchedQuantity: quantity,
 				Decimals:        levels[i].Decimals,
+				Timestamp:       time.Now().UTC(),
 			}
 
 			if order.Side == OrderSideBuy {
