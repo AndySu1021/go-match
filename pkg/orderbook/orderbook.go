@@ -49,12 +49,12 @@ func NewOrderBook(basePath string) (*OrderBook, error) {
 
 	for i := 0; i < len(protoOB.Asks); i++ {
 		ob.Asks[i] = convertPbPriceLevel(protoOB.Asks[i])
-		ob.TotalOrderCount += uint32(len(ob.Asks))
+		ob.TotalOrderCount += uint32(len(ob.Asks[i].Orders))
 	}
 
 	for i := 0; i < len(protoOB.Bids); i++ {
 		ob.Bids[i] = convertPbPriceLevel(protoOB.Bids[i])
-		ob.TotalOrderCount += uint32(len(ob.Bids))
+		ob.TotalOrderCount += uint32(len(ob.Bids[i].Orders))
 	}
 
 	ob.buildOrderMap()
