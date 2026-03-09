@@ -40,20 +40,24 @@ func NewOrderBook(basePath string) (*OrderBook, error) {
 	}
 
 	ob := &OrderBook{
-		Asks:      make([]PriceLevel, len(protoOB.Asks)),
-		Bids:      make([]PriceLevel, len(protoOB.Bids)),
-		LastSeqID: protoOB.LastSeqId,
+		Asks:              make([]PriceLevel, len(protoOB.Asks)),
+		Bids:              make([]PriceLevel, len(protoOB.Bids)),
+		LastSeqID:         protoOB.LastSeqId,
+		TotalOrderCount:   0,
+		TotalRemovedCount: 0,
 	}
 
 	for i := 0; i < len(protoOB.Asks); i++ {
 		ob.Asks[i] = convertPbPriceLevel(protoOB.Asks[i])
+		ob.TotalOrderCount += uint32(len(ob.Asks))
 	}
 
 	for i := 0; i < len(protoOB.Bids); i++ {
 		ob.Bids[i] = convertPbPriceLevel(protoOB.Bids[i])
+		ob.TotalOrderCount += uint32(len(ob.Bids))
 	}
 
-	ob.buildOrderMap(protoOB.OrderSize)
+	ob.buildOrderMap()
 
 	return ob, nil
 }
@@ -104,14 +108,17 @@ func (ob *OrderBook) Match(order Order) (MatchResult, []MatchInfo, error) {
 		ob.Bids = levels
 		total += count
 
-		ob.buildOrderMap(total)
+		ob.TotalRemovedCount = 0
+		ob.TotalOrderCount = total
+
+		ob.buildOrderMap()
 	}
 
 	return res, infos, nil
 }
 
-func (ob *OrderBook) buildOrderMap(size uint32) {
-	ob.OrderMap = swiss.NewMap[uint64, OrderLocation](size)
+func (ob *OrderBook) buildOrderMap() {
+	ob.OrderMap = swiss.NewMap[uint64, OrderLocation](ob.TotalOrderCount)
 
 	for i, pl := range ob.Asks {
 		for j, o := range pl.Orders {
@@ -138,11 +145,40 @@ func (ob *OrderBook) CancelOrder(orderId uint64) error {
 	ob.Lock.Lock()
 	defer ob.Lock.Unlock()
 
-	return ob.removeOrder(orderId)
+	loc, ok := ob.OrderMap.Get(orderId)
+	if !ok {
+		slog.Error(fmt.Sprintf("order not found: %d", orderId))
+		return nil
+	}
+
+	var levels []PriceLevel
+	if loc.Side == OrderSideBuy {
+		levels = ob.Bids
+	} else {
+		levels = ob.Asks
+	}
+
+	if loc.LevelPos >= len(levels) {
+		return internal.ErrPriceLevelNotFound
+	}
+
+	// 只標記，不實際刪除
+	levels[loc.LevelPos].Orders[loc.Offset].IsRemoved = true
+	levels[loc.LevelPos].RemovedCount++
+
+	if loc.Side == OrderSideBuy {
+		ob.Bids = levels
+	} else {
+		ob.Asks = levels
+	}
+
+	ob.TotalRemovedCount++
+
+	return nil
 }
 
 func (ob *OrderBook) Snapshot(basePath string) error {
-	go func() {
+	defer func() {
 		runtime.GC()
 		debug.FreeOSMemory()
 	}()
@@ -184,23 +220,12 @@ func (ob *OrderBook) Snapshot(basePath string) error {
 }
 
 func (ob *OrderBook) shouldPurge() bool {
-	totalRemoved := 0
-	totalOrders := 0
-	for _, pl := range ob.Asks {
-		totalRemoved += pl.RemovedCount
-		totalOrders += len(pl.Orders)
-	}
-	for _, pl := range ob.Bids {
-		totalRemoved += pl.RemovedCount
-		totalOrders += len(pl.Orders)
-	}
-
-	if totalOrders == 0 {
+	if ob.TotalOrderCount == 0 {
 		return false
 	}
 
-	return totalRemoved >= PurgeThresholdOrders ||
-		float64(totalRemoved)/float64(totalOrders) >= PurgeThresholdRatio
+	return ob.TotalRemovedCount >= PurgeThresholdOrders ||
+		float64(ob.TotalRemovedCount)/float64(ob.TotalOrderCount) >= PurgeThresholdRatio
 }
 
 func (ob *OrderBook) String() string {
@@ -245,7 +270,6 @@ func (ob *OrderBook) addOrder(order Order) error {
 		IsRemoved: false,
 	}
 
-	needRebuild := false
 	if pos < len(levels) && levels[pos].Price == order.Price {
 		offset = len(levels[pos].Orders)
 		levels[pos].Orders = append(levels[pos].Orders, levelOrder)
@@ -258,7 +282,13 @@ func (ob *OrderBook) addOrder(order Order) error {
 			Orders:   []LevelOrder{levelOrder},
 		}
 		offset = 0
-		needRebuild = true
+		ob.OrderMap.Iter(func(id uint64, loc OrderLocation) bool {
+			if loc.Side == order.Side && loc.LevelPos >= pos {
+				loc.LevelPos++
+				ob.OrderMap.Put(id, loc)
+			}
+			return false
+		})
 	}
 
 	ob.OrderMap.Put(order.ID, OrderLocation{
@@ -273,42 +303,7 @@ func (ob *OrderBook) addOrder(order Order) error {
 		ob.Asks = levels
 	}
 
-	if needRebuild {
-		ob.buildOrderMap(uint32(ob.OrderMap.Count()))
-	}
-
-	return nil
-}
-
-func (ob *OrderBook) removeOrder(orderId uint64) error {
-	loc, ok := ob.OrderMap.Get(orderId)
-	if !ok {
-		slog.Error(fmt.Sprintf("order not found: %d", orderId))
-		return nil
-	}
-
-	var levels []PriceLevel
-	if loc.Side == OrderSideBuy {
-		levels = ob.Bids
-	} else {
-		levels = ob.Asks
-	}
-
-	if loc.LevelPos >= len(levels) {
-		return internal.ErrPriceLevelNotFound
-	}
-
-	// 只標記，不實際刪除
-	levels[loc.LevelPos].Orders[loc.Offset].IsRemoved = true
-	levels[loc.LevelPos].RemovedCount++
-
-	if loc.Side == OrderSideBuy {
-		ob.Bids = levels
-	} else {
-		ob.Asks = levels
-	}
-
-	ob.OrderMap.Delete(orderId)
+	ob.TotalOrderCount++
 
 	return nil
 }
@@ -370,8 +365,8 @@ func (ob *OrderBook) handleGTC(order Order) (MatchResult, []MatchInfo, error) {
 }
 
 func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook bool) (MatchResult, []MatchInfo, error) {
-	res := make([]MatchInfo, 0)
-	toRemove := make([]uint64, 0)
+	res := make([]MatchInfo, 0, 8)
+	now := time.Now().UTC()
 
 	var levels []PriceLevel
 	if order.Side == OrderSideBuy {
@@ -407,7 +402,7 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 				MatchedPrice:    levels[i].Price,
 				MatchedQuantity: quantity,
 				Decimals:        levels[i].Decimals,
-				Timestamp:       time.Now().UTC(),
+				Timestamp:       now,
 			}
 
 			if order.Side == OrderSideBuy {
@@ -421,15 +416,13 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 			res = append(res, info)
 
 			if levels[i].Orders[j].Quantity == 0 {
-				toRemove = append(toRemove, levels[i].Orders[j].ID)
+				levels[i].Orders[j].IsRemoved = true
+				levels[i].RemovedCount++
+				ob.TotalRemovedCount++
 			}
 
 			j = nextActive(levels[i].Orders, j+1)
 		}
-	}
-
-	for i := 0; i < len(toRemove); i++ {
-		_ = ob.removeOrder(toRemove[i])
 	}
 
 	if order.Side == OrderSideBuy {

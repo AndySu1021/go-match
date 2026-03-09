@@ -41,11 +41,13 @@ const (
 )
 
 type OrderBook struct {
-	Lock      sync.RWMutex                      `json:"-"`
-	Asks      []PriceLevel                      `json:"asks"`
-	Bids      []PriceLevel                      `json:"bids"`
-	OrderMap  *swiss.Map[uint64, OrderLocation] `json:"order_map"`
-	LastSeqID uint64                            `json:"last_seq_id"`
+	Lock              sync.RWMutex                      `json:"-"`
+	Asks              []PriceLevel                      `json:"asks"`
+	Bids              []PriceLevel                      `json:"bids"`
+	OrderMap          *swiss.Map[uint64, OrderLocation] `json:"order_map"`
+	LastSeqID         uint64                            `json:"last_seq_id"`
+	TotalOrderCount   uint32                            `json:"total_order_count"`
+	TotalRemovedCount uint32                            `json:"total_removed_count"`
 }
 
 func (ob OrderBook) MarshalJSON() ([]byte, error) {
@@ -74,7 +76,6 @@ func (ob *OrderBook) ToProto() *gen.OrderBook {
 		Asks:      make([]*gen.PriceLevel, len(ob.Asks)),
 		Bids:      make([]*gen.PriceLevel, len(ob.Bids)),
 		LastSeqId: ob.LastSeqID,
-		OrderSize: uint32(ob.OrderMap.Count()),
 	}
 	for i := range ob.Asks {
 		res.Asks[i] = ob.Asks[i].ToPB()

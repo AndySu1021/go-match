@@ -19,5 +19,4 @@ message OrderBook {
   repeated PriceLevel asks = 1;
   repeated PriceLevel bids = 2;
   uint64 last_seq_id = 3;
-  uint32 order_size = 4;
 }
