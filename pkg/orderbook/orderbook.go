@@ -190,9 +190,9 @@ func (ob *OrderBook) Snapshot(basePath string) error {
 		err     error
 	)
 
-	ob.Lock.RLock()
+	ob.Lock.Lock()
 	p := ob.ToProto()
-	ob.Lock.RUnlock()
+	ob.Lock.Unlock()
 
 	content, err = proto.Marshal(p)
 	if err != nil {

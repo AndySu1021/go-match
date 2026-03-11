@@ -41,7 +41,7 @@ const (
 )
 
 type OrderBook struct {
-	Lock              sync.RWMutex                      `json:"-"`
+	Lock              sync.Mutex                        `json:"-"`
 	Asks              []PriceLevel                      `json:"asks"`
 	Bids              []PriceLevel                      `json:"bids"`
 	OrderMap          *swiss.Map[uint64, OrderLocation] `json:"order_map"`
