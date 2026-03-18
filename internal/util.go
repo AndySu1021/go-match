@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func readMemUsage(ctx context.Context) {
+func ReadMemUsage(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -29,7 +29,7 @@ func readMemUsage(ctx context.Context) {
 	}
 }
 
-func pprof() {
+func RegisterPprof() {
 	if err := http.ListenAndServe("localhost:5000", nil); err != nil {
 		panic(err)
 	}
