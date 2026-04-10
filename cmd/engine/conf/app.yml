@@ -1,8 +1,12 @@
 env: "local"
 instrument: "BTC_USDT"
+mode: "grpc" #grpc, http, event
+
+net:
+  addr: ":3000"
 
 snapshot:
-  dir: "/Users/andysu/Desktop/open-source/go-match/runtime/"
+  path: "/Users/andysu/Desktop/open-source/go-match/runtime/snapshot.bin"
   period: 60
 
 consumer:

@@ -1,0 +1,9 @@
+// order.proto
+syntax = "proto3";
+package order;
+option go_package = "./proto";
+
+message RespMeta {
+  int32 code = 1;
+  string msg = 2;
+}

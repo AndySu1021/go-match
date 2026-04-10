@@ -1,0 +1,56 @@
+// order.proto
+syntax = "proto3";
+package order;
+option go_package = "./proto";
+
+import "common.proto";
+
+service MatchService {
+  rpc AddOrder(AddOrderReq) returns (AddOrderResp);
+  rpc CancelOrder(CancelOrderReq) returns (CancelOrderResp);
+  rpc UpdateOrder(UpdateOrderReq) returns (UpdateOrderResp);
+}
+
+enum OrderType {
+  OrderType_UNKNOWN = 0;
+  OrderType_LIMIT = 1;
+  OrderType_FOK = 2;
+  OrderType_IOC = 3;
+  OrderType_GTC = 4;
+}
+
+enum OrderSide {
+  OrderSide_UNKNOWN = 0;
+  OrderSide_BUY = 1;
+  OrderSide_SELL = 2;
+}
+
+message AddOrderReq {
+  uint64 id = 1;
+  string price = 2;
+  string quantity = 3;
+  OrderSide side = 6;
+  OrderType type = 7;
+}
+
+message AddOrderResp {
+  RespMeta meta = 1;
+}
+
+message CancelOrderReq {
+  uint64 id = 1;
+}
+
+message CancelOrderResp {
+  RespMeta meta = 1;
+}
+
+message UpdateOrderReq {
+  uint64 id = 1;
+  string price = 2;
+  string quantity = 3;
+}
+
+message UpdateOrderResp {
+  RespMeta meta = 1;
+}

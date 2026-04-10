@@ -1,473 +1,486 @@
 package orderbook
 
 import (
-	"encoding/json"
+	"bytes"
+	"container/list"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"go-match/internal"
-	"go-match/proto/gen"
-	"log/slog"
 	"os"
-	"path"
-	"runtime"
-	"runtime/debug"
-	"sort"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/dolthub/swiss"
-	"google.golang.org/protobuf/proto"
+	rbt "github.com/emirpasic/gods/trees/redblacktree"
+	"github.com/emirpasic/gods/utils"
+	"golang.org/x/sys/unix"
 )
 
-func NewOrderBook(basePath string) (*OrderBook, error) {
-	content, err := os.ReadFile(path.Join(basePath, "snapshot.bin"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Error(fmt.Sprintf("read file error: %s", err))
-		return nil, err
-	}
+type Order struct {
+	ID           uint64 `json:"id"`
+	Price        uint64 `json:"price"`
+	Quantity     uint64 `json:"quantity"`
+	Side         Side   `json:"side"`
+	IsProcessing bool
+}
 
-	if errors.Is(err, os.ErrNotExist) {
-		return &OrderBook{
-			Asks:     make([]PriceLevel, 0),
-			Bids:     make([]PriceLevel, 0),
-			OrderMap: swiss.NewMap[uint64, OrderLocation](0),
-		}, nil
+func (order *Order) ToRecord() OrderRecord {
+	return OrderRecord{
+		ID:           order.ID,
+		Price:        order.Price,
+		Quantity:     order.Quantity,
+		Side:         uint8(order.Side),
+		IsProcessing: order.IsProcessing,
 	}
+}
 
-	protoOB := &gen.OrderBook{}
-	if err = proto.Unmarshal(content, protoOB); err != nil {
-		slog.Error(fmt.Sprintf("unmarshal protobuf error: %s", err))
-		return nil, err
-	}
+type OrderRecord struct {
+	ID           uint64
+	Price        uint64
+	Quantity     uint64
+	Side         uint8
+	IsProcessing bool
+	_            [5]byte // align to 32 bytes
+}
 
+type PriceLevel struct {
+	Price  uint64
+	Orders *list.List
+}
+
+type SnapshotMetadata struct {
+	LastSeqID       uint64
+	TotalOrderCount uint32
+}
+
+type OrderBook struct {
+	mu        sync.Mutex
+	Bids      *rbt.Tree
+	Asks      *rbt.Tree
+	OrderMap  *swiss.Map[uint64, *list.Element]
+	LastSeqID uint64
+}
+
+func NewOrderBook() *OrderBook {
 	ob := &OrderBook{
-		Asks:              make([]PriceLevel, len(protoOB.Asks)),
-		Bids:              make([]PriceLevel, len(protoOB.Bids)),
-		LastSeqID:         protoOB.LastSeqId,
-		TotalOrderCount:   0,
-		TotalRemovedCount: 0,
+		OrderMap: swiss.NewMap[uint64, *list.Element](0),
+		Bids:     rbt.NewWith(utils.UInt64Comparator),
+		Asks:     rbt.NewWith(asksComparator),
 	}
 
-	for i := 0; i < len(protoOB.Asks); i++ {
-		ob.Asks[i] = convertPbPriceLevel(protoOB.Asks[i])
-		ob.TotalOrderCount += uint32(len(ob.Asks[i].Orders))
-	}
-
-	for i := 0; i < len(protoOB.Bids); i++ {
-		ob.Bids[i] = convertPbPriceLevel(protoOB.Bids[i])
-		ob.TotalOrderCount += uint32(len(ob.Bids[i].Orders))
-	}
-
-	ob.buildOrderMap()
-
-	return ob, nil
+	return ob
 }
 
-func (ob *OrderBook) Match(order Order) (MatchResult, []MatchInfo, error) {
-	ob.Lock.Lock()
-	defer ob.Lock.Unlock()
+func (ob *OrderBook) AddOrder(order Order) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 
-	var (
-		res   MatchResult
-		infos []MatchInfo
-		err   error
-	)
-
-	switch order.Type {
-	case OrderTypeLimit:
-		if err = ob.addOrder(order); err != nil {
-			return MatchResult{}, nil, err
-		}
-		res = MatchResult{Success: true}
-	case OrderTypeIOC:
-		res, infos, err = ob.handleIOC(order)
-		if err != nil {
-			return MatchResult{}, nil, err
-		}
-	case OrderTypeFOK:
-		res, infos, err = ob.handleFOK(order)
-		if err != nil {
-			return MatchResult{}, nil, err
-		}
-	case OrderTypeGTC:
-		res, infos, err = ob.handleGTC(order)
-		if err != nil {
-			return MatchResult{}, nil, err
-		}
+	if ob.OrderMap.Has(order.ID) {
+		return fmt.Errorf("order exist: %d", order.ID)
 	}
 
-	if ob.shouldPurge() {
-		total := uint32(0)
+	tree := ob.getTree(order.Side)
 
-		// handle ask price
-		count, levels := purgeLevels(ob.Asks)
-		ob.Asks = levels
-		total += count
-
-		// handle bid price
-		count, levels = purgeLevels(ob.Bids)
-		ob.Bids = levels
-		total += count
-
-		ob.TotalRemovedCount = 0
-		ob.TotalOrderCount = total
-
-		ob.buildOrderMap()
+	val, found := tree.Get(order.Price)
+	if !found {
+		val = &PriceLevel{Price: order.Price, Orders: list.New()}
+		tree.Put(order.Price, val)
 	}
 
-	return res, infos, nil
-}
+	order.IsProcessing = false
 
-func (ob *OrderBook) buildOrderMap() {
-	ob.OrderMap = swiss.NewMap[uint64, OrderLocation](ob.TotalOrderCount)
+	level := val.(*PriceLevel)
+	el := level.Orders.PushBack(&order)
 
-	for i, pl := range ob.Asks {
-		for j, o := range pl.Orders {
-			ob.OrderMap.Put(o.ID, OrderLocation{
-				Side:     OrderSideSell,
-				LevelPos: i,
-				Offset:   j,
-			})
-		}
-	}
+	ob.OrderMap.Put(order.ID, el)
 
-	for i, pl := range ob.Bids {
-		for j, o := range pl.Orders {
-			ob.OrderMap.Put(o.ID, OrderLocation{
-				Side:     OrderSideBuy,
-				LevelPos: i,
-				Offset:   j,
-			})
-		}
-	}
+	return nil
 }
 
 func (ob *OrderBook) CancelOrder(orderId uint64) error {
-	ob.Lock.Lock()
-	defer ob.Lock.Unlock()
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 
-	loc, ok := ob.OrderMap.Get(orderId)
+	tmp, ok := ob.OrderMap.Get(orderId)
 	if !ok {
-		slog.Error(fmt.Sprintf("order not found: %d", orderId))
-		return nil
+		return fmt.Errorf("order not found: %d", orderId)
 	}
 
-	var levels []PriceLevel
-	if loc.Side == OrderSideBuy {
-		levels = ob.Bids
-	} else {
-		levels = ob.Asks
+	order := tmp.Value.(*Order)
+
+	tree := ob.getTree(order.Side)
+	level, found := tree.Get(order.Price)
+	if !found {
+		return fmt.Errorf("level not found: %d", order.Price)
 	}
 
-	if loc.LevelPos >= len(levels) {
-		return internal.ErrPriceLevelNotFound
+	level.(*PriceLevel).Orders.Remove(tmp)
+	if level.(*PriceLevel).Orders.Len() == 0 {
+		tree.Remove(order.Price)
 	}
-
-	// 只標記，不實際刪除
-	levels[loc.LevelPos].Orders[loc.Offset].IsRemoved = true
-	levels[loc.LevelPos].RemovedCount++
-
-	if loc.Side == OrderSideBuy {
-		ob.Bids = levels
-	} else {
-		ob.Asks = levels
-	}
-
-	ob.TotalRemovedCount++
+	ob.OrderMap.Delete(order.ID)
 
 	return nil
 }
 
-func (ob *OrderBook) Snapshot(basePath string) error {
-	defer func() {
-		runtime.GC()
-		debug.FreeOSMemory()
-	}()
+func (ob *OrderBook) UpdateOrder(params Order) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 
-	startTime := time.Now()
-
-	var (
-		content []byte
-		err     error
-	)
-
-	ob.Lock.Lock()
-	p := ob.ToProto()
-	ob.Lock.Unlock()
-
-	content, err = proto.Marshal(p)
-	if err != nil {
-		slog.Error(fmt.Sprintf("marshal snapshot error: %s", err))
-		return err
+	tmp, ok := ob.OrderMap.Get(params.ID)
+	if !ok {
+		return fmt.Errorf("order not found: %d", params.ID)
 	}
 
-	tmpPath := path.Join(basePath, "snapshot.bin.tmp")
-	finalPath := path.Join(basePath, "snapshot.bin")
+	currOrder := tmp.Value.(*Order)
 
-	if err = os.WriteFile(tmpPath, content, 0644); err != nil {
-		slog.Error(fmt.Sprintf("write snapshot error: %s", err))
-		return err
+	if currOrder.IsProcessing {
+		return fmt.Errorf("order is processing: %d", params.ID)
 	}
 
-	// atomic rename，避免寫到一半系統 crash 影響上一版的 snapshot 檔案
-	if err = os.Rename(tmpPath, finalPath); err != nil {
-		slog.Error(fmt.Sprintf("rename snapshot error: %s", err))
-		return err
-	}
-
-	slog.Info(fmt.Sprintf("snapshot latency: %d ms", time.Since(startTime).Milliseconds()))
-
-	return nil
-}
-
-func (ob *OrderBook) shouldPurge() bool {
-	if ob.TotalOrderCount == 0 {
-		return false
-	}
-
-	return ob.TotalRemovedCount >= PurgeThresholdOrders ||
-		float64(ob.TotalRemovedCount)/float64(ob.TotalOrderCount) >= PurgeThresholdRatio
-}
-
-func (ob *OrderBook) String() string {
-	tmp, _ := json.Marshal(ob)
-	return string(tmp)
-}
-
-func (ob *OrderBook) addOrder(order Order) error {
-	if order.Quantity == 0 {
-		slog.Error(fmt.Sprintf("order quantity is zero: %d", order.ID))
+	if currOrder.Price == params.Price && currOrder.Quantity == params.Quantity {
 		return nil
 	}
 
-	if ob.OrderMap.Has(order.ID) {
-		slog.Error(fmt.Sprintf("order exist: %d", order.ID))
+	if currOrder.Price == params.Price {
+		currOrder.Quantity = params.Quantity
 		return nil
 	}
 
-	var levels []PriceLevel
-	if order.Side == OrderSideBuy {
-		levels = ob.Bids
-	} else {
-		levels = ob.Asks
+	if err := ob.CancelOrder(params.ID); err != nil {
+		return err
 	}
 
-	pos := 0
-	if order.Side == OrderSideBuy {
-		pos = sort.Search(len(levels), func(i int) bool {
-			return levels[i].Price <= order.Price
-		})
-	} else {
-		pos = sort.Search(len(levels), func(i int) bool {
-			return levels[i].Price >= order.Price
-		})
-	}
-
-	var offset int
-
-	levelOrder := LevelOrder{
-		ID:        order.ID,
-		Quantity:  order.Quantity,
-		IsRemoved: false,
-	}
-
-	if pos < len(levels) && levels[pos].Price == order.Price {
-		offset = len(levels[pos].Orders)
-		levels[pos].Orders = append(levels[pos].Orders, levelOrder)
-	} else {
-		levels = append(levels, PriceLevel{})
-		copy(levels[pos+1:], levels[pos:])
-		levels[pos] = PriceLevel{
-			Price:    order.Price,
-			Decimals: order.Decimals,
-			Orders:   []LevelOrder{levelOrder},
-		}
-		offset = 0
-		ob.OrderMap.Iter(func(id uint64, loc OrderLocation) bool {
-			if loc.Side == order.Side && loc.LevelPos >= pos {
-				loc.LevelPos++
-				ob.OrderMap.Put(id, loc)
-			}
-			return false
-		})
-	}
-
-	ob.OrderMap.Put(order.ID, OrderLocation{
-		Side:     order.Side,
-		LevelPos: pos,
-		Offset:   offset,
+	return ob.AddOrder(Order{
+		ID:           currOrder.ID,
+		Price:        params.Price,
+		Quantity:     params.Quantity,
+		Side:         currOrder.Side,
+		IsProcessing: currOrder.IsProcessing,
 	})
-
-	if order.Side == OrderSideBuy {
-		ob.Bids = levels
-	} else {
-		ob.Asks = levels
-	}
-
-	ob.TotalOrderCount++
-
-	return nil
 }
 
-func (ob *OrderBook) handleIOC(order Order) (MatchResult, []MatchInfo, error) {
+func (ob *OrderBook) HandleIOC(order Order) ([]MatchInfo, error) {
 	return ob.handleMatch(order, false, false)
 }
 
-func (ob *OrderBook) handleFOK(order Order) (MatchResult, []MatchInfo, error) {
-	// 第一階段：確認可用量是否足夠
-	available := uint64(0)
-	filled := false
-
-	var levels []PriceLevel
-	if order.Side == OrderSideBuy {
-		levels = ob.Asks
-	} else {
-		levels = ob.Bids
-	}
-
-outer:
-	for i := 0; i < len(levels); i++ {
-		if levels[i].IsEmpty() {
-			continue
-		}
-
-		if order.Side == OrderSideBuy {
-			if levels[i].Price > order.Price {
-				break
-			}
-		} else {
-			if levels[i].Price < order.Price {
-				break
-			}
-		}
-
-		for j := 0; j < len(levels[i].Orders); j++ {
-			o := levels[i].Orders[j]
-			if o.IsRemoved {
-				continue
-			}
-			available += o.Quantity
-			if available >= order.Quantity {
-				filled = true
-				break outer
-			}
-		}
-	}
-
+func (ob *OrderBook) HandleFOK(order Order) ([]MatchInfo, error) {
+	filled := ob.handleMockMatch(order, true)
 	if !filled {
-		return MatchResult{Success: false, Error: internal.ErrFOKInsufficientLiquidity}, nil, nil
+		return nil, internal.ErrFOKInsufficientLiquidity
 	}
 
 	return ob.handleMatch(order, true, false)
 }
 
-func (ob *OrderBook) handleGTC(order Order) (MatchResult, []MatchInfo, error) {
+func (ob *OrderBook) HandleGTC(order Order) ([]MatchInfo, error) {
 	return ob.handleMatch(order, true, true)
 }
 
-func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook bool) (MatchResult, []MatchInfo, error) {
+func (ob *OrderBook) Snapshot(filePath string) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	// 預先分配：1000萬 × 32 bytes = 320MB，在 5 秒內可寫完（NVMe ~3GB/s）
+	totalOrders := ob.OrderMap.Count()
+	bidsCount := countOrders(ob.Bids)
+	asksCount := countOrders(ob.Asks)
+
+	// 使用 bufio.Writer 大幅降低 syscall 次數
+	f, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	headerSize := binary.Size(SnapshotMetadata{})
+	recordSize := binary.Size(OrderRecord{})
+	bidsOffset := headerSize
+	asksOffset := headerSize + bidsCount*recordSize
+	totalSize := asksOffset + asksCount*recordSize
+
+	if err = f.Truncate(int64(totalSize)); err != nil {
+		return err // 失敗也沒關係，繼續
+	}
+
+	// 3. mmap 整個檔案用於寫入
+	data, err := unix.Mmap(
+		int(f.Fd()), 0, totalSize,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Munmap(data)
+
+	// 1. 寫 Header
+	meta := SnapshotMetadata{
+		LastSeqID:       ob.LastSeqID,
+		TotalOrderCount: uint32(totalOrders),
+	}
+
+	*(*SnapshotMetadata)(unsafe.Pointer(&data[0])) = meta
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		offset := bidsOffset
+		it := ob.Bids.Iterator()
+		it.End()
+		for it.Prev() {
+			level := it.Value().(*PriceLevel)
+			for el := level.Orders.Front(); el != nil; el = el.Next() {
+				order := el.Value.(*Order)
+				*(*OrderRecord)(unsafe.Pointer(&data[offset])) = order.ToRecord()
+				offset += recordSize
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		offset := asksOffset
+		it := ob.Asks.Iterator()
+		for it.Next() {
+			level := it.Value().(*PriceLevel)
+			for el := level.Orders.Front(); el != nil; el = el.Next() {
+				order := el.Value.(*Order)
+				*(*OrderRecord)(unsafe.Pointer(&data[offset])) = order.ToRecord()
+				offset += recordSize
+			}
+		}
+	}()
+
+	wg.Wait()
+	return unix.Msync(data, unix.MS_SYNC)
+}
+
+func (ob *OrderBook) Restore(filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	fi, _ := f.Stat()
+
+	// mmap 整個檔案，避免大量 read syscall
+	data, err := unix.Mmap(
+		int(f.Fd()), 0, int(fi.Size()),
+		unix.PROT_READ, unix.MAP_SHARED,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Munmap(data)
+
+	// 讀 Header
+	var meta SnapshotMetadata
+	metaSize := binary.Size(meta)
+	r := bytes.NewReader(data[:metaSize])
+	binary.Read(r, binary.LittleEndian, &meta)
+	ob.LastSeqID = meta.LastSeqID
+
+	// 預先分配 OrderMap 容量，避免 rehash
+	ob.OrderMap = swiss.NewMap[uint64, *list.Element](meta.TotalOrderCount)
+
+	recSize := binary.Size(OrderRecord{})
+	offset := metaSize
+
+	var currentPrice uint64
+	var currentLevel *PriceLevel
+	var currentTree *rbt.Tree
+
+	for i := 0; i < int(meta.TotalOrderCount); i++ {
+		rec := *(*OrderRecord)(unsafe.Pointer(&data[offset]))
+		offset += recSize
+
+		tree := ob.getTree(Side(rec.Side))
+
+		// 同一個 price level 連續出現，不需要重複 tree.Get/Put
+		if rec.Price != currentPrice || tree != currentTree {
+			currentPrice = rec.Price
+			currentTree = tree
+			currentLevel = &PriceLevel{Price: rec.Price, Orders: list.New()}
+			tree.Put(rec.Price, currentLevel)
+		}
+
+		order := &Order{
+			ID:       rec.ID,
+			Price:    rec.Price,
+			Quantity: rec.Quantity,
+			Side:     Side(rec.Side),
+		}
+
+		el := currentLevel.Orders.PushBack(order)
+		ob.OrderMap.Put(order.ID, el)
+	}
+
+	return nil
+}
+
+func (ob *OrderBook) getTree(side Side) *rbt.Tree {
+	var tree *rbt.Tree
+
+	if side == SideBuy {
+		tree = ob.Bids
+	} else {
+		tree = ob.Asks
+	}
+
+	return tree
+}
+
+func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook bool) ([]MatchInfo, error) {
 	res := make([]MatchInfo, 0, 8)
 	now := time.Now().UTC()
 
-	var levels []PriceLevel
-	if order.Side == OrderSideBuy {
-		levels = ob.Asks
+	var tree *rbt.Tree
+	if order.Side == SideBuy {
+		tree = ob.Asks
 	} else {
-		levels = ob.Bids
+		tree = ob.Bids
 	}
 
-	for i := 0; i < len(levels) && order.Quantity > 0; i++ {
-		if levels[i].IsEmpty() {
-			continue
+	for order.Quantity > 0 && !tree.Empty() {
+		var node *rbt.Node
+		node = tree.Left()
+		if node == nil {
+			break
 		}
 
+		bestPrice := node.Key.(uint64)
 		if isPriceRelated {
-			if order.Side == OrderSideBuy {
-				if levels[i].Price > order.Price {
-					break
-				}
-			} else {
-				if levels[i].Price < order.Price {
-					break
-				}
+			if order.Side == SideBuy && bestPrice > order.Price {
+				break
+			} else if order.Side == SideSell && bestPrice < order.Price {
+				break
 			}
 		}
 
-		j := nextActive(levels[i].Orders, 0)
-		for order.Quantity > 0 && j != -1 {
-			quantity := min(levels[i].Orders[j].Quantity, order.Quantity)
-			levels[i].Orders[j].Quantity -= quantity
+		orders := node.Value.(*PriceLevel).Orders
+		el := orders.Front()
+		for el != nil {
+			tmpOrder := el.Value.(*Order)
+
+			quantity := min(tmpOrder.Quantity, order.Quantity)
+			tmpOrder.Quantity -= quantity
 			order.Quantity -= quantity
 
 			info := MatchInfo{
-				MatchedPrice:    levels[i].Price,
+				MatchedPrice:    tmpOrder.Price,
 				MatchedQuantity: quantity,
-				Decimals:        levels[i].Decimals,
 				Timestamp:       now,
 			}
 
-			if order.Side == OrderSideBuy {
+			if order.Side == SideBuy {
 				info.BuyerOrderID = order.ID
-				info.SellerOrderID = levels[i].Orders[j].ID
+				info.SellerOrderID = tmpOrder.ID
 			} else {
-				info.BuyerOrderID = levels[i].Orders[j].ID
+				info.BuyerOrderID = tmpOrder.ID
 				info.SellerOrderID = order.ID
 			}
 
 			res = append(res, info)
 
-			if levels[i].Orders[j].Quantity == 0 {
-				levels[i].Orders[j].IsRemoved = true
-				levels[i].RemovedCount++
-				ob.TotalRemovedCount++
+			if tmpOrder.Quantity == 0 {
+				tmp := el
+				el = el.Next()
+				orders.Remove(tmp)
 			}
 
-			j = nextActive(levels[i].Orders, j+1)
+			if order.Quantity == 0 {
+				break
+			}
 		}
-	}
 
-	if order.Side == OrderSideBuy {
-		ob.Asks = levels
-	} else {
-		ob.Bids = levels
+		if orders.Len() == 0 {
+			tree.Remove(bestPrice)
+		}
 	}
 
 	// 剩餘量掛回訂單簿
 	if needAddOrderBook && order.Quantity > 0 {
-		if err := ob.addOrder(order); err != nil {
-			return MatchResult{Success: false, Error: err}, nil, err
+		if err := ob.AddOrder(Order{
+			ID:           order.ID,
+			Price:        order.Price,
+			Quantity:     order.Quantity,
+			Side:         order.Side,
+			IsProcessing: true,
+		}); err != nil {
+			return nil, err
 		}
 	}
 
-	return MatchResult{Success: true}, res, nil
+	return res, nil
 }
 
-func nextActive(orders []LevelOrder, j int) int {
-	for j < len(orders) {
-		if !orders[j].IsRemoved {
-			return j
-		}
-		j++
+func (ob *OrderBook) handleMockMatch(order Order, isPriceRelated bool) bool {
+	var tree *rbt.Tree
+	if order.Side == SideBuy {
+		tree = ob.Asks
+	} else {
+		tree = ob.Bids
 	}
-	return -1
-}
 
-func purgeLevels(levels []PriceLevel) (uint32, []PriceLevel) {
-	result := make([]PriceLevel, 0, len(levels))
-	count := uint32(0)
-	for _, pl := range levels {
-		if pl.IsEmpty() {
-			continue
+	for order.Quantity > 0 && !tree.Empty() {
+		var node *rbt.Node
+		node = tree.Left()
+		if node == nil {
+			break
 		}
-		active := make([]LevelOrder, 0, len(pl.Orders)-pl.RemovedCount)
-		for _, o := range pl.Orders {
-			if !o.IsRemoved {
-				active = append(active, o)
-				count++
+
+		bestPrice := node.Key.(uint64)
+		if isPriceRelated {
+			if order.Side == SideBuy && bestPrice > order.Price {
+				break
+			} else if order.Side == SideSell && bestPrice < order.Price {
+				break
 			}
 		}
-		pl.Orders = active
-		pl.RemovedCount = 0
-		result = append(result, pl)
+
+		orders := node.Value.(*PriceLevel).Orders
+		for el := orders.Front(); el != nil; el = el.Next() {
+			tmpOrder := el.Value.(*Order)
+			tmpQuantity := tmpOrder.Quantity
+
+			quantity := min(tmpQuantity, order.Quantity)
+			tmpQuantity -= quantity
+			order.Quantity -= quantity
+
+			if order.Quantity == 0 {
+				break
+			}
+		}
 	}
-	return count, result
+
+	return order.Quantity == 0
+}
+
+func asksComparator(a, b interface{}) int {
+	a1 := a.(uint64)
+	b1 := b.(uint64)
+	if a1 < b1 {
+		return 1
+	} else if a1 > b1 {
+		return -1
+	}
+	return 0
+}
+
+func countOrders(tree *rbt.Tree) int {
+	total := 0
+	it := tree.Iterator()
+	for it.Next() {
+		total += it.Value().(*PriceLevel).Orders.Len()
+	}
+	return total
 }
