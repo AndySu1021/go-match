@@ -20,20 +20,27 @@ func NewMatchGrpcHandler(svc model.IMatchService) *MatchGrpcHandler {
 }
 
 func (h *MatchGrpcHandler) AddOrder(ctx context.Context, req *gen.AddOrderReq) (*gen.AddOrderResp, error) {
-	if err := h.svc.AddOrder(ctx, types.AddOrderParams{
+	infos, err := h.svc.AddOrder(ctx, types.AddOrderParams{
 		ID:       req.Id,
 		Price:    req.Price,
 		Quantity: req.Quantity,
 		Side:     orderbook.Side(req.Side),
 		Type:     types.OrderType(req.Type),
-	}); err != nil {
+	})
+	if err != nil {
 		return &gen.AddOrderResp{
 			Meta: convert.CommonErrRespMeta(err),
 		}, err
 	}
 
+	res := make([]*gen.MatchInfo, len(infos))
+	for i := 0; i < len(infos); i++ {
+		res[i] = infos[i].ToPB()
+	}
+
 	return &gen.AddOrderResp{
-		Meta: convert.CommonRespMeta(),
+		Meta:  convert.CommonRespMeta(),
+		Infos: res,
 	}, nil
 }
 

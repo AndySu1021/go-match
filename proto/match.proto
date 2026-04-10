@@ -33,8 +33,17 @@ message AddOrderReq {
   OrderType type = 7;
 }
 
+message MatchInfo {
+  string price = 1;
+  string quantity = 2;
+  uint64 buyer_order_id = 3;
+  uint64 seller_order_id = 4;
+  uint64 timestamp = 5;
+}
+
 message AddOrderResp {
   RespMeta meta = 1;
+  repeated MatchInfo infos = 2;
 }
 
 message CancelOrderReq {

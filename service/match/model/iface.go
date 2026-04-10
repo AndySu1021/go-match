@@ -6,7 +6,7 @@ import (
 )
 
 type IMatchService interface {
-	AddOrder(ctx context.Context, params types.AddOrderParams) error
+	AddOrder(ctx context.Context, params types.AddOrderParams) ([]types.MatchInfoResp, error)
 	CancelOrder(ctx context.Context, orderId uint64) error
 	UpdateOrder(ctx context.Context, params types.UpdateOrderParams) error
 	Snapshot(ctx context.Context)

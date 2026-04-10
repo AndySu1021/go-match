@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"go-match/config"
 	"go-match/pkg/orderbook"
@@ -30,20 +29,20 @@ func NewMatchService(cfg *config.AppConfig) *MatchService {
 	}
 }
 
-func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderParams) error {
+func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderParams) ([]types.MatchInfoResp, error) {
 	price, quantity, err := getPriceAndQuantity(params.Price, params.Quantity)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var (
-		res       []orderbook.MatchInfo
+		infos     []orderbook.MatchInfo
 		handleErr error
 	)
 
 	switch params.Type {
 	case types.OrderTypeLimit:
-		return svc.ob.AddOrder(orderbook.Order{
+		return nil, svc.ob.AddOrder(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
@@ -51,7 +50,7 @@ func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderPara
 			IsProcessing: false,
 		})
 	case types.OrderTypeFOK:
-		res, handleErr = svc.ob.HandleFOK(orderbook.Order{
+		infos, handleErr = svc.ob.HandleFOK(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
@@ -59,7 +58,7 @@ func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderPara
 			IsProcessing: false,
 		})
 	case types.OrderTypeIOC:
-		res, handleErr = svc.ob.HandleFOK(orderbook.Order{
+		infos, handleErr = svc.ob.HandleIOC(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
@@ -67,24 +66,36 @@ func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderPara
 			IsProcessing: false,
 		})
 	case types.OrderTypeGTC:
-		res, handleErr = svc.ob.HandleFOK(orderbook.Order{
+		infos, handleErr = svc.ob.HandleGTC(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
 			Side:         params.Side,
 			IsProcessing: false,
 		})
+	default:
+		return nil, fmt.Errorf("invalid order type: %s", params.Type)
 	}
 
 	if handleErr != nil {
-		return handleErr
+		return nil, handleErr
+	}
+
+	res := make([]types.MatchInfoResp, len(infos))
+	for i := 0; i < len(infos); i++ {
+		info := infos[i]
+		res[i] = types.MatchInfoResp{
+			Price:         decimal.NewFromUint64(info.MatchedPrice).Div(decimal.New(1, DECIMALS)).String(),
+			Quantity:      decimal.NewFromUint64(info.MatchedQuantity).Div(decimal.New(1, DECIMALS)).String(),
+			BuyerOrderID:  info.BuyerOrderID,
+			SellerOrderID: info.SellerOrderID,
+			Timestamp:     info.Timestamp,
+		}
 	}
 
 	// TODO: send match info to nats
-	tmp, _ := json.Marshal(res)
-	slog.Debug("match result: ", string(tmp))
 
-	return fmt.Errorf("invalid order type: %s", params.Type)
+	return res, nil
 }
 
 func (svc *MatchService) CancelOrder(ctx context.Context, orderId uint64) error {
