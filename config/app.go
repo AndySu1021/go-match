@@ -9,12 +9,12 @@ const (
 )
 
 type AppConfig struct {
-	Env        string   `mapstructure:"env"`
-	Instrument string   `mapstructure:"instrument"`
-	Mode       Mode     `mapstructure:"mode"`
-	Net        Net      `mapstructure:"net"`
-	Snapshot   Snapshot `mapstructure:"snapshot"`
-	Consumer   Consumer `mapstructure:"consumer"`
+	Env         string   `mapstructure:"env"`
+	Instruments []string `mapstructure:"instruments"`
+	Net         Net      `mapstructure:"net"`
+	Snapshot    Snapshot `mapstructure:"snapshot"`
+	WAL         WAL      `mapstructure:"wal"`
+	Consumer    Consumer `mapstructure:"consumer"`
 }
 
 type Net struct {
@@ -22,8 +22,12 @@ type Net struct {
 }
 
 type Snapshot struct {
-	Path   string `mapstructure:"path"`
+	Dir    string `mapstructure:"dir"`
 	Period int    `mapstructure:"period"`
+}
+
+type WAL struct {
+	Dir string `mapstructure:"dir"`
 }
 
 type Consumer struct {

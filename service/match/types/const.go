@@ -25,3 +25,14 @@ func (o OrderType) String() string {
 	}
 	return ""
 }
+
+const WalSize = 100000
+
+type Action uint8
+
+const (
+	ActionUnknown Action = iota
+	ActionAdd
+	ActionCancel
+	ActionUpdate
+)

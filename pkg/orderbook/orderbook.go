@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"go-match/internal"
 	"os"
+	"path"
 	"sync"
 	"time"
 	"unsafe"
@@ -23,7 +24,8 @@ type Order struct {
 	Price        uint64 `json:"price"`
 	Quantity     uint64 `json:"quantity"`
 	Side         Side   `json:"side"`
-	IsProcessing bool
+	IsProcessing bool   `json:"isProcessing"`
+	SeqID        uint64 `json:"seq_id"`
 }
 
 func (order *Order) ToRecord() OrderRecord {
@@ -56,28 +58,41 @@ type SnapshotMetadata struct {
 }
 
 type OrderBook struct {
-	mu        sync.Mutex
-	Bids      *rbt.Tree
-	Asks      *rbt.Tree
-	OrderMap  *swiss.Map[uint64, *list.Element]
-	LastSeqID uint64
+	mu         sync.Mutex
+	instrument string
+	bids       *rbt.Tree
+	asks       *rbt.Tree
+	orderMap   *swiss.Map[uint64, *list.Element]
+	snapPath   string
+	lastSeqID  uint64
 }
 
-func NewOrderBook() *OrderBook {
+func NewOrderBook(instrument string, dir string) *OrderBook {
 	ob := &OrderBook{
-		OrderMap: swiss.NewMap[uint64, *list.Element](0),
-		Bids:     rbt.NewWith(utils.UInt64Comparator),
-		Asks:     rbt.NewWith(asksComparator),
+		instrument: instrument,
+		bids:       rbt.NewWith(utils.UInt64Comparator),
+		asks:       rbt.NewWith(asksComparator),
+		orderMap:   swiss.NewMap[uint64, *list.Element](0),
+		snapPath:   path.Join(dir, fmt.Sprintf("snap_%s.bin", instrument)),
+		lastSeqID:  0,
 	}
 
 	return ob
+}
+
+func (ob *OrderBook) GetInstrument() string {
+	return ob.instrument
+}
+
+func (ob *OrderBook) GetLastSeqID() uint64 {
+	return ob.lastSeqID
 }
 
 func (ob *OrderBook) AddOrder(order Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	if ob.OrderMap.Has(order.ID) {
+	if ob.orderMap.Has(order.ID) {
 		return fmt.Errorf("order exist: %d", order.ID)
 	}
 
@@ -94,18 +109,19 @@ func (ob *OrderBook) AddOrder(order Order) error {
 	level := val.(*PriceLevel)
 	el := level.Orders.PushBack(&order)
 
-	ob.OrderMap.Put(order.ID, el)
+	ob.orderMap.Put(order.ID, el)
+	ob.lastSeqID = order.SeqID
 
 	return nil
 }
 
-func (ob *OrderBook) CancelOrder(orderId uint64) error {
+func (ob *OrderBook) CancelOrder(params Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	tmp, ok := ob.OrderMap.Get(orderId)
+	tmp, ok := ob.orderMap.Get(params.ID)
 	if !ok {
-		return fmt.Errorf("order not found: %d", orderId)
+		return fmt.Errorf("order not found: %d", params.ID)
 	}
 
 	order := tmp.Value.(*Order)
@@ -120,7 +136,8 @@ func (ob *OrderBook) CancelOrder(orderId uint64) error {
 	if level.(*PriceLevel).Orders.Len() == 0 {
 		tree.Remove(order.Price)
 	}
-	ob.OrderMap.Delete(order.ID)
+	ob.orderMap.Delete(order.ID)
+	ob.lastSeqID = params.SeqID
 
 	return nil
 }
@@ -129,7 +146,7 @@ func (ob *OrderBook) UpdateOrder(params Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	tmp, ok := ob.OrderMap.Get(params.ID)
+	tmp, ok := ob.orderMap.Get(params.ID)
 	if !ok {
 		return fmt.Errorf("order not found: %d", params.ID)
 	}
@@ -149,34 +166,70 @@ func (ob *OrderBook) UpdateOrder(params Order) error {
 		return nil
 	}
 
-	if err := ob.CancelOrder(params.ID); err != nil {
+	if err := ob.CancelOrder(params); err != nil {
 		return err
 	}
 
-	return ob.AddOrder(Order{
+	if err := ob.AddOrder(Order{
 		ID:           currOrder.ID,
 		Price:        params.Price,
 		Quantity:     params.Quantity,
 		Side:         currOrder.Side,
 		IsProcessing: currOrder.IsProcessing,
-	})
+	}); err != nil {
+		return err
+	}
+
+	ob.lastSeqID = params.SeqID
+
+	return nil
 }
 
 func (ob *OrderBook) HandleIOC(order Order) ([]MatchInfo, error) {
-	return ob.handleMatch(order, false, false)
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	res, err := ob.handleMatch(order, false, false)
+	if err != nil {
+		return nil, err
+	}
+
+	ob.lastSeqID = order.SeqID
+
+	return res, nil
 }
 
 func (ob *OrderBook) HandleFOK(order Order) ([]MatchInfo, error) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
 	filled := ob.handleMockMatch(order, true)
 	if !filled {
 		return nil, internal.ErrFOKInsufficientLiquidity
 	}
 
-	return ob.handleMatch(order, true, false)
+	res, err := ob.handleMatch(order, true, false)
+	if err != nil {
+		return nil, err
+	}
+
+	ob.lastSeqID = order.SeqID
+
+	return res, nil
 }
 
 func (ob *OrderBook) HandleGTC(order Order) ([]MatchInfo, error) {
-	return ob.handleMatch(order, true, true)
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	res, err := ob.handleMatch(order, true, true)
+	if err != nil {
+		return nil, err
+	}
+
+	ob.lastSeqID = order.SeqID
+
+	return res, nil
 }
 
 func (ob *OrderBook) Snapshot(filePath string) error {
@@ -184,12 +237,12 @@ func (ob *OrderBook) Snapshot(filePath string) error {
 	defer ob.mu.Unlock()
 
 	// 預先分配：1000萬 × 32 bytes = 320MB，在 5 秒內可寫完（NVMe ~3GB/s）
-	totalOrders := ob.OrderMap.Count()
-	bidsCount := countOrders(ob.Bids)
-	asksCount := countOrders(ob.Asks)
+	totalOrders := ob.orderMap.Count()
+	bidsCount := countOrders(ob.bids)
+	asksCount := countOrders(ob.asks)
 
 	// 使用 bufio.Writer 大幅降低 syscall 次數
-	f, err := os.Create(filePath)
+	f, err := os.Create(ob.snapPath)
 	if err != nil {
 		return err
 	}
@@ -218,7 +271,7 @@ func (ob *OrderBook) Snapshot(filePath string) error {
 
 	// 1. 寫 Header
 	meta := SnapshotMetadata{
-		LastSeqID:       ob.LastSeqID,
+		LastSeqID:       ob.lastSeqID,
 		TotalOrderCount: uint32(totalOrders),
 	}
 
@@ -230,7 +283,7 @@ func (ob *OrderBook) Snapshot(filePath string) error {
 	go func() {
 		defer wg.Done()
 		offset := bidsOffset
-		it := ob.Bids.Iterator()
+		it := ob.bids.Iterator()
 		it.End()
 		for it.Prev() {
 			level := it.Value().(*PriceLevel)
@@ -245,7 +298,7 @@ func (ob *OrderBook) Snapshot(filePath string) error {
 	go func() {
 		defer wg.Done()
 		offset := asksOffset
-		it := ob.Asks.Iterator()
+		it := ob.asks.Iterator()
 		for it.Next() {
 			level := it.Value().(*PriceLevel)
 			for el := level.Orders.Front(); el != nil; el = el.Next() {
@@ -257,11 +310,15 @@ func (ob *OrderBook) Snapshot(filePath string) error {
 	}()
 
 	wg.Wait()
-	return unix.Msync(data, unix.MS_SYNC)
+	if err = unix.Msync(data, unix.MS_SYNC); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (ob *OrderBook) Restore(filePath string) error {
-	f, err := os.Open(filePath)
+func (ob *OrderBook) Restore() error {
+	f, err := os.Open(ob.snapPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -287,10 +344,10 @@ func (ob *OrderBook) Restore(filePath string) error {
 	metaSize := binary.Size(meta)
 	r := bytes.NewReader(data[:metaSize])
 	binary.Read(r, binary.LittleEndian, &meta)
-	ob.LastSeqID = meta.LastSeqID
+	ob.lastSeqID = meta.LastSeqID
 
 	// 預先分配 OrderMap 容量，避免 rehash
-	ob.OrderMap = swiss.NewMap[uint64, *list.Element](meta.TotalOrderCount)
+	ob.orderMap = swiss.NewMap[uint64, *list.Element](meta.TotalOrderCount)
 
 	recSize := binary.Size(OrderRecord{})
 	offset := metaSize
@@ -321,7 +378,7 @@ func (ob *OrderBook) Restore(filePath string) error {
 		}
 
 		el := currentLevel.Orders.PushBack(order)
-		ob.OrderMap.Put(order.ID, el)
+		ob.orderMap.Put(order.ID, el)
 	}
 
 	return nil
@@ -331,9 +388,9 @@ func (ob *OrderBook) getTree(side Side) *rbt.Tree {
 	var tree *rbt.Tree
 
 	if side == SideBuy {
-		tree = ob.Bids
+		tree = ob.bids
 	} else {
-		tree = ob.Asks
+		tree = ob.asks
 	}
 
 	return tree
@@ -345,9 +402,9 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 
 	var tree *rbt.Tree
 	if order.Side == SideBuy {
-		tree = ob.Asks
+		tree = ob.asks
 	} else {
-		tree = ob.Bids
+		tree = ob.bids
 	}
 
 	for order.Quantity > 0 && !tree.Empty() {
@@ -426,9 +483,9 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 func (ob *OrderBook) handleMockMatch(order Order, isPriceRelated bool) bool {
 	var tree *rbt.Tree
 	if order.Side == SideBuy {
-		tree = ob.Asks
+		tree = ob.asks
 	} else {
-		tree = ob.Bids
+		tree = ob.bids
 	}
 
 	for order.Quantity > 0 && !tree.Empty() {

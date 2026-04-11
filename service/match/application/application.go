@@ -3,12 +3,9 @@ package application
 import (
 	"context"
 	"fmt"
-	"go-match/config"
 	"go-match/pkg/orderbook"
 	"go-match/service/match/model"
 	"go-match/service/match/types"
-	"log/slog"
-	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -18,14 +15,12 @@ var _ model.IMatchService = (*MatchService)(nil)
 const DECIMALS = 8
 
 type MatchService struct {
-	ob  *orderbook.OrderBook
-	cfg *config.AppConfig
+	obMap map[string]*orderbook.OrderBook // instrument -> obMap
 }
 
-func NewMatchService(cfg *config.AppConfig) *MatchService {
+func NewMatchService() *MatchService {
 	return &MatchService{
-		ob:  orderbook.NewOrderBook(),
-		cfg: cfg,
+		obMap: make(map[string]*orderbook.OrderBook),
 	}
 }
 
@@ -40,38 +35,47 @@ func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderPara
 		handleErr error
 	)
 
+	ob, err := svc.getOrderBook(params.Instrument)
+	if err != nil {
+		return nil, err
+	}
+
 	switch params.Type {
 	case types.OrderTypeLimit:
-		return nil, svc.ob.AddOrder(orderbook.Order{
+		return nil, ob.AddOrder(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
 			Side:         params.Side,
 			IsProcessing: false,
+			SeqID:        params.SeqID,
 		})
 	case types.OrderTypeFOK:
-		infos, handleErr = svc.ob.HandleFOK(orderbook.Order{
+		infos, handleErr = ob.HandleFOK(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
 			Side:         params.Side,
 			IsProcessing: false,
+			SeqID:        params.SeqID,
 		})
 	case types.OrderTypeIOC:
-		infos, handleErr = svc.ob.HandleIOC(orderbook.Order{
+		infos, handleErr = ob.HandleIOC(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
 			Side:         params.Side,
 			IsProcessing: false,
+			SeqID:        params.SeqID,
 		})
 	case types.OrderTypeGTC:
-		infos, handleErr = svc.ob.HandleGTC(orderbook.Order{
+		infos, handleErr = ob.HandleGTC(orderbook.Order{
 			ID:           params.ID,
 			Price:        price,
 			Quantity:     quantity,
 			Side:         params.Side,
 			IsProcessing: false,
+			SeqID:        params.SeqID,
 		})
 	default:
 		return nil, fmt.Errorf("invalid order type: %s", params.Type)
@@ -98,8 +102,16 @@ func (svc *MatchService) AddOrder(ctx context.Context, params types.AddOrderPara
 	return res, nil
 }
 
-func (svc *MatchService) CancelOrder(ctx context.Context, orderId uint64) error {
-	return svc.ob.CancelOrder(orderId)
+func (svc *MatchService) CancelOrder(ctx context.Context, params types.CancelOrderParams) error {
+	ob, err := svc.getOrderBook(params.Instrument)
+	if err != nil {
+		return err
+	}
+
+	return ob.CancelOrder(orderbook.Order{
+		ID:    params.ID,
+		SeqID: params.SeqID,
+	})
 }
 
 func (svc *MatchService) UpdateOrder(ctx context.Context, params types.UpdateOrderParams) error {
@@ -108,31 +120,29 @@ func (svc *MatchService) UpdateOrder(ctx context.Context, params types.UpdateOrd
 		return err
 	}
 
-	return svc.ob.UpdateOrder(orderbook.Order{
+	ob, err := svc.getOrderBook(params.Instrument)
+	if err != nil {
+		return err
+	}
+
+	return ob.UpdateOrder(orderbook.Order{
 		ID:       params.ID,
 		Price:    price,
 		Quantity: quantity,
+		SeqID:    params.SeqID,
 	})
 }
 
-func (svc *MatchService) Snapshot(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(svc.cfg.Snapshot.Period) * time.Second):
-			slog.Info("start snapshot...")
-			if err := svc.ob.Snapshot(svc.cfg.Snapshot.Path); err != nil {
-				slog.Error("snapshot error: ", err)
-				return
-			}
-			slog.Info("snapshot completed")
-		}
-	}
+func (svc *MatchService) RegisterOrderBook(instrument string, ob *orderbook.OrderBook) {
+	svc.obMap[instrument] = ob
 }
 
-func (svc *MatchService) Restore(ctx context.Context) error {
-	return svc.ob.Restore(svc.cfg.Snapshot.Path)
+func (svc *MatchService) getOrderBook(instrument string) (*orderbook.OrderBook, error) {
+	if _, ok := svc.obMap[instrument]; !ok {
+		return nil, fmt.Errorf("instrument %s not exist", instrument)
+	}
+
+	return svc.obMap[instrument], nil
 }
 
 func getPriceAndQuantity(price string, quantity string) (uint64, uint64, error) {

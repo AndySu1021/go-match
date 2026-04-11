@@ -2,21 +2,28 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"go-match/config"
+	"go-match/pkg/orderbook"
 	"go-match/proto/gen"
 	"go-match/service/match/application"
 	"go-match/service/match/handler"
 	"go-match/service/match/model"
+	"go-match/service/match/types"
 	"log"
 	"log/slog"
 	"net"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )
@@ -26,7 +33,9 @@ const (
 )
 
 var (
-	svc model.IMatchService
+	svc     model.IMatchService
+	obMap   map[string]*orderbook.OrderBook
+	walPath string
 )
 
 func init() {
@@ -42,9 +51,25 @@ func init() {
 		Nats: config.InitNatsConfig(),
 	}
 
-	svc = application.NewMatchService(cfg.App)
-	if err := svc.Restore(context.Background()); err != nil {
-		panic(fmt.Sprintf("order book restore error: %s", err))
+	walPath = path.Join(cfg.App.WAL.Dir, "wal.bin")
+
+	svc = application.NewMatchService()
+	obMap = make(map[string]*orderbook.OrderBook)
+	for i := 0; i < len(cfg.App.Instruments); i++ {
+		instrument := cfg.App.Instruments[i]
+		ob := orderbook.NewOrderBook(instrument, cfg.App.Snapshot.Dir)
+		obMap[cfg.App.Instruments[i]] = ob
+		svc.RegisterOrderBook(instrument, ob)
+
+		// Restore
+		if err := ob.Restore(); err != nil {
+			panic(fmt.Sprintf("order book restore error: %s", err))
+		}
+	}
+
+	// Replay
+	if err := replay(); err != nil {
+		panic(fmt.Sprintf("replay error: %s", err))
 	}
 }
 
@@ -134,8 +159,30 @@ func main() {
 		//grpc.StatsHandler(&connStatsHandler{}), // 註冊 StatsHandler
 	)
 
+	f, err := os.Create(walPath)
+	if err != nil {
+		panic(err)
+	}
+
+	recordSize := binary.Size(types.WalRecord{})
+	totalSize := recordSize * types.WalSize
+
+	if err = f.Truncate(int64(totalSize)); err != nil {
+		panic(err)
+	}
+
+	// 3. mmap 整個檔案用於寫入
+	data, err := unix.Mmap(
+		int(f.Fd()), 0, totalSize,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
+	)
+	if err != nil {
+		panic(err)
+	}
+
 	// TODO: add health check
-	gen.RegisterMatchServiceServer(srv, handler.NewMatchGrpcHandler(svc))
+	gen.RegisterMatchServiceServer(srv, handler.NewMatchGrpcHandler(svc, data))
 
 	// register monitor or background process
 	go svc.Snapshot(ctx)
@@ -151,6 +198,11 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
+
+	unix.Msync(data, unix.MS_SYNC)
+	unix.Munmap(data)
+
+	// TODO: maybe one more snapshot
 
 	slog.Info("🛑 Shutting down...")
 
@@ -281,3 +333,85 @@ func main() {
 //	}
 //	return nil
 //}
+
+func snapshot(ctx context.Context, ob *orderbook.OrderBook, cfg *config.AppConfig) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(cfg.Snapshot.Period) * time.Second):
+			slog.Info("start snapshot...")
+			if err := ob.Snapshot(cfg.Snapshot.Dir); err != nil {
+				slog.Error("snapshot error: ", err)
+				return
+			}
+			slog.Info("snapshot completed")
+		}
+	}
+}
+
+func replay() error {
+	f, err := os.Open(walPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open wal file error: %s", err)
+	}
+	defer f.Close()
+
+	fi, _ := f.Stat()
+
+	// mmap 整個檔案，避免大量 read syscall
+	data, err := unix.Mmap(
+		int(f.Fd()), 0, int(fi.Size()),
+		unix.PROT_READ, unix.MAP_SHARED,
+	)
+	if err != nil {
+		panic(fmt.Sprintf("mmap error: %s", err))
+	}
+	defer unix.Munmap(data)
+
+	ctx := context.Background()
+
+	offset := 0
+	recordSize := binary.Size(types.WalRecord{})
+	total := fi.Size() / int64(recordSize)
+	for i := 0; i < int(total); i++ {
+		record := *(*types.WalRecord)(unsafe.Pointer(&data[offset]))
+		offset += recordSize
+		switch types.Action(record.Action) {
+		case types.ActionAdd:
+			if _, err = svc.AddOrder(ctx, types.AddOrderParams{
+				Instrument: record.Instrument,
+				ID:         record.ID,
+				Price:      record.Price,
+				Quantity:   record.Quantity,
+				Side:       orderbook.Side(record.Side),
+				Type:       types.OrderType(record.Type),
+			}); err != nil {
+				return err
+			}
+		case types.ActionCancel:
+			if err = svc.CancelOrder(ctx, types.CancelOrderParams{
+				Instrument: record.Instrument,
+				ID:         record.ID,
+			}); err != nil {
+				return err
+			}
+		case types.ActionUpdate:
+			if err = svc.UpdateOrder(ctx, types.UpdateOrderParams{
+				Instrument: record.Instrument,
+				ID:         record.ID,
+				Price:      record.Price,
+				Quantity:   record.Quantity,
+			}); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown action: %d", record.Action)
+		}
+	}
+
+	return nil
+}

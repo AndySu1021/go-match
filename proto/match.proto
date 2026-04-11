@@ -26,11 +26,12 @@ enum OrderSide {
 }
 
 message AddOrderReq {
-  uint64 id = 1;
-  string price = 2;
-  string quantity = 3;
-  OrderSide side = 6;
-  OrderType type = 7;
+  string instrument = 1;
+  uint64 id = 2;
+  string price = 3;
+  string quantity = 4;
+  OrderSide side = 5;
+  OrderType type = 6;
 }
 
 message MatchInfo {
@@ -47,7 +48,8 @@ message AddOrderResp {
 }
 
 message CancelOrderReq {
-  uint64 id = 1;
+  string instrument = 1;
+  uint64 id = 2;
 }
 
 message CancelOrderResp {
@@ -55,9 +57,10 @@ message CancelOrderResp {
 }
 
 message UpdateOrderReq {
-  uint64 id = 1;
-  string price = 2;
-  string quantity = 3;
+  string instrument = 1;
+  uint64 id = 2;
+  string price = 3;
+  string quantity = 4;
 }
 
 message UpdateOrderResp {
