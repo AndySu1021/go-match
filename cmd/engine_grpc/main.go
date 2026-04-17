@@ -64,11 +64,10 @@ func init() {
 		instrument := cfg.App.Instruments[i]
 		ob := orderbook.NewOrderBook(instrument, cfg.App.Snapshot.Dir)
 		obMap[instrument] = ob
+		svc.RegisterOrderBook(instrument, ob)
 
 		go func(instrument string, ob *orderbook.OrderBook) {
 			defer wg.Done()
-
-			svc.RegisterOrderBook(instrument, ob)
 
 			// Restore
 			if err := ob.Restore(); err != nil {

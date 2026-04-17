@@ -1,7 +1,6 @@
 package orderbook
 
 import (
-	"bytes"
 	"container/list"
 	"encoding/binary"
 	"errors"
@@ -340,17 +339,14 @@ func (ob *OrderBook) Restore() error {
 	defer unix.Munmap(data)
 
 	// 讀 Header
-	var meta SnapshotMetadata
-	metaSize := binary.Size(meta)
-	r := bytes.NewReader(data[:metaSize])
-	binary.Read(r, binary.LittleEndian, &meta)
+	metaSize := binary.Size(SnapshotMetadata{})
+	meta := *(*SnapshotMetadata)(unsafe.Pointer(&data[0]))
+	recSize := binary.Size(OrderRecord{})
+	offset := metaSize
 	ob.lastSeqID = meta.LastSeqID
 
 	// 預先分配 OrderMap 容量，避免 rehash
 	ob.orderMap = swiss.NewMap[uint64, *list.Element](meta.TotalOrderCount)
-
-	recSize := binary.Size(OrderRecord{})
-	offset := metaSize
 
 	var currentPrice uint64
 	var currentLevel *PriceLevel
@@ -452,6 +448,7 @@ func (ob *OrderBook) handleMatch(order Order, isPriceRelated, needAddOrderBook b
 				tmp := el
 				el = el.Next()
 				orders.Remove(tmp)
+				ob.orderMap.Delete(tmpOrder.ID)
 			}
 
 			if order.Quantity == 0 {
