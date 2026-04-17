@@ -87,6 +87,10 @@ func (ob *OrderBook) GetLastSeqID() uint64 {
 	return ob.lastSeqID
 }
 
+func (ob *OrderBook) ResetSeqID() {
+	ob.lastSeqID = 0
+}
+
 func (ob *OrderBook) AddOrder(order Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()

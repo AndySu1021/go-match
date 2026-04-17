@@ -78,6 +78,13 @@ func init() {
 			if err := replay(instrument, ob.GetLastSeqID()); err != nil {
 				panic(fmt.Sprintf("replay error: %s", err))
 			}
+
+			ob.ResetSeqID()
+
+			// Snapshot
+			if err := ob.Snapshot(cfg.App.Snapshot.Dir); err != nil {
+				panic(fmt.Sprintf("snapshot error: %s", err))
+			}
 		}(instrument, ob)
 	}
 
@@ -279,11 +286,13 @@ func replay(instrument string, lastSeqId uint64) error {
 				Quantity:   params.Quantity,
 				Side:       params.Side,
 				Type:       params.Type,
+				SeqID:      record.SeqID,
 			})
 		case types.ActionCancel:
 			_ = svc.CancelOrder(ctx, types.CancelOrderParams{
 				Instrument: params.Instrument,
 				ID:         params.ID,
+				SeqID:      record.SeqID,
 			})
 		case types.ActionUpdate:
 			_ = svc.UpdateOrder(ctx, types.UpdateOrderParams{
@@ -291,6 +300,7 @@ func replay(instrument string, lastSeqId uint64) error {
 				ID:         params.ID,
 				Price:      params.Price,
 				Quantity:   params.Quantity,
+				SeqID:      record.SeqID,
 			})
 		default:
 			return fmt.Errorf("unknown action: %d", params.Action)
